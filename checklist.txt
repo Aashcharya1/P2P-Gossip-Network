@@ -1,0 +1,13 @@
+Done:
+Registration consensus (basic)
+Gossip
+Message deduplication
+
+TODO:
+Implement proper peer-level suspicion voting
+Implement seed-level dead node consensus
+Implement power-law neighbor selection
+Add file logging
+Improve concurrency safety
+Add retry logic
+Handle crashes
