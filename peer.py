@@ -1,346 +1,483 @@
 import socket
 import threading
-import time
 import sys
+import time
 import random
 from common import *
 
+# Global configuration
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
+SELF_ID = f"{HOST}:{PORT}"
 
+# Thread-safe data structures
+peer_list = set()
+neighbors = set()      # Active connections (IP:PORT format)
+message_list = set()   # ML for gossip hashes
+suspicion_votes = {}   # Tracks how many neighbors suspect a node is dead
+last_seen = {}         # Tracks the last successful ping time
 
-# Tracks suspected nodes and who confirmed
-suspicions = {}
-# Format:
-# {
-#   "IP:PORT": {
-#       "votes": set(),
-#       "start_time": timestamp
-#   }
-# }
+state_lock = threading.Lock()
+log_file = None  # Will be initialized in main
 
-neighbors = set()      # Other peers we are connected to
-message_list = set()   # History of message hashes (to prevent infinite loops)
-lock = threading.Lock()
+def log_peer(message):
+    # Include node ID in log message for identification
+    log_message = f"[{SELF_ID}] {message}"
+    print(log_message)
+    if log_file:
+        try:
+            log_file.write(log_message + "\n")
+            log_file.flush()
+        except:
+            pass
 
 def load_seeds():
+    """
+    Load seed node addresses from config file.
+    Tries config.txt first, then config.csv if config.txt doesn't exist.
+    Supports both formats as per assignment requirements.
+    """
     seeds = []
-    with open("config.txt") as f:
-        for line in f:
-            ip, port = line.strip().split(":")
-            seeds.append((ip, int(port)))
+    config_files = ["config.txt", "config.csv"]
+    
+    for config_file in config_files:
+        try:
+            with open(config_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):  # Skip comments
+                        # Handle CSV format (if comma-separated) or colon-separated
+                        if "," in line:
+                            ip, port = line.split(",")
+                        else:
+                            ip, port = line.split(":")
+                        seeds.append((ip.strip(), int(port.strip())))
+                if seeds:  # If we found seeds, break
+                    break
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            print(f"Error loading {config_file}: {e}")
+    
+    if not seeds:
+        print("Warning: No seeds found in config.txt or config.csv")
+    
     return seeds
 
-SEEDS = load_seeds()
-
-def register():
-    """Pick a majority of seeds and tell them 'I am online'."""
-    # We choose a random majority (n/2 + 1) of seeds to register with
-    chosen = random.sample(SEEDS, len(SEEDS)//2 + 1)
-    for ip, port in chosen:
-        try:
-            s = socket.socket()
-            s.settimeout(3) # prevents hanging if seed is down
-
-            s.connect((ip, port))
-            send_json(s, {
-                "type": "REGISTER",
-                "peer": f"{HOST}:{PORT}"
-            })
-            s.close()
-        except:
-            pass
-
-def fetch_peers():
-    """Ask seeds for the current list of verified peers in the network."""
-    all_peers = set()
-    for ip, port in SEEDS:
-        try:
-            s = socket.socket()
-            s.settimeout(3)
-
-            s.connect((ip, port))
-            send_json(s, {"type": "GET_PEERS"})
-            data = recv_json(s)
-            if data and data["type"] == "PEER_LIST":
-                for p in data["peers"]:
-                    if p != f"{HOST}:{PORT}": # Don't add yourself as a neighbor
-                        all_peers.add(p)
-            s.close()
-        except:
-            pass
-    return all_peers
-
-def connect_neighbors(peers):
-    for p in peers:
-        neighbors.add(p)
-
-def broadcast(msg):
-    """The core of the Gossip Protocol."""
-    h = hash_message(msg) # Generate a unique fingerprint for the message
-
-    with lock:
-        # CRITICAL: If we have already seen this hash, stop! 
-        # This prevents the message from bouncing back and forth forever.
-        if h in message_list:
-            return
-        message_list.add(h)
-
-    with lock:
-        current_neighbors = list(neighbors)
-    
-    # Forward the message to every known neighbor
-    for p in current_neighbors:
-        ip, port = p.split(":")
-        try:
-            s = socket.socket()
-            s.settimeout(3)
-
-            s.connect((ip, int(port)))
-            send_json(s, {"type": "GOSSIP", "message": msg})
-            s.close()
-        except:
-            pass
-
-def gossip_sender():
-    """Background thread that generates 10 unique messages over time."""
-    count = 0
-    while count < 10:
-        time.sleep(5)
-        msg = f"{time.time()}:{HOST}:{count}" # Create a unique timestamped message
-        broadcast(msg)
-        count += 1
-
-def report_dead_to_seeds(target):
-    """
-    After peer-level majority agreement,
-    notify connected seeds.
-    """
-    for ip, port in SEEDS:
-        try:
-            s = socket.socket()
-            s.settimeout(3)
-
-            s.connect((ip, port))
-            send_json(s, {
-                "type": "DEAD_REPORT",
-                "target": target
-            })
-            s.close()
-        except:
-            pass
-
-def handle_client(conn, addr):
-    """
-    Handles incoming peer-to-peer messages.
-    Defensive parsing is used to prevent crashes due to malformed
-    or partial network data.
-    """
-    data = recv_json(conn)
-
-    # If connection closed abruptly or invalid JSON received
-    if not data:
-        conn.close()
+def register_and_get_peers():
+    seeds = load_seeds()
+    if not seeds:
+        log_peer("[ERROR] No seeds available in config.txt or config.csv")
         return
 
-    # Use .get() to avoid KeyError if "type" is missing
-    msg_type = data.get("type")
+    req_seeds = len(seeds) // 2 + 1
+    chosen_seeds = random.sample(seeds, min(req_seeds, len(seeds)))
+    log_peer(f"[REGISTRATION] Attempting to register with {req_seeds} out of {len(seeds)} seeds")
 
-    # GOSSIP 
-    if msg_type == "GOSSIP":
-        msg = data.get("message")
-        if not msg:
-            conn.close()
-            return
-
-        print(f"[GOSSIP RECEIVED] {msg}")
-        broadcast(msg)
-
-    # SUSPECT REQUEST - A peer is asking "Can you reach this target node?"
-    elif msg_type == "SUSPECT_REQUEST":
-        target = data.get("target")
-        requester = data.get("requester")
-
-        # Validate required fields
-        if not target or not requester:
-            conn.close()
-            return
-
-        alive = check_node_alive(target) # Attempt direct ping to target to see if it's alive
-
-        response = {
-            "type": "SUSPECT_RESPONSE",
-            "target": target,
-            "alive": alive,
-            "responder": f"{HOST}:{PORT}"
-        }
-
-        ip, port = requester.split(":")
-        try:
-            s = socket.socket()
-            s.settimeout(3)
-            s.connect((ip, int(port)))
-            send_json(s, response)
-            s.close()
-        except:
-            pass  # If requester is gone, ignore
-
-    # SUSPECT RESPONSE 
-    elif msg_type == "SUSPECT_RESPONSE":
-        target = data.get("target")
-        alive = data.get("alive")
-        responder = data.get("responder")
-
-        # Validate fields
-        if target is None or alive is None or responder is None:
-            conn.close()
-            return
-
-        if not alive:
-            with lock:
-                if target in suspicions:
-                    suspicions[target]["votes"].add(responder)
-
-                    total_voters = len(neighbors) - 1
-                    required = total_voters // 2 + 1
-
-                    if len(suspicions[target]["votes"]) >= required:
-                        print(f"[PEER CONSENSUS] {target} confirmed dead")
-
-                        neighbors.discard(target)
-                        del suspicions[target]
-
-                        report_dead_to_seeds(target)
-
-    # Unknown message types are ignored safely
-    conn.close()
-
-
-def start_server():
-    server = socket.socket()
-    server.bind((HOST, PORT))
-    server.listen()
-
-    print(f"[PEER] Running at {HOST}:{PORT}")
-
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr)).start()
-
-
-PING_TIMEOUT = 3
-SUSPICION_TIMEOUT = 5
-
-
-def ping_neighbors():
-    """
-    Periodically checks neighbor liveness.
-    If ping fails, initiate suspicion protocol.
-    """
-    while True:
-        time.sleep(5)
-
-        for neighbor in list(neighbors):
-            ip, port = neighbor.split(":")
+    # 1. Register
+    for seed_ip, seed_port in chosen_seeds:
+        retries = 3
+        while retries > 0:
             try:
                 s = socket.socket()
                 s.settimeout(3)
+                s.connect((seed_ip, seed_port))
+                send_json(s, {"type": "REGISTER", "peer": SELF_ID})
+                s.close()
+                log_peer(f"[REGISTRATION] Sent registration to {seed_ip}:{seed_port}")
+                break
+            except Exception as e:
+                retries -= 1
+                if retries == 0:
+                    log_peer(f"[REGISTRATION] Failed to register with {seed_ip}:{seed_port}")
+                else:
+                    time.sleep(0.5)
 
-                s.settimeout(PING_TIMEOUT)
+    time.sleep(2) # Wait for seeds to reach consensus
+
+    # 2. Retrieve Peer Lists
+    for seed_ip, seed_port in seeds:
+        retries = 3
+        while retries > 0:
+            try:
+                s = socket.socket()
+                s.settimeout(3)
+                s.connect((seed_ip, seed_port))
+                send_json(s, {"type": "GET_PEERS"})
+                res = recv_json(s)
+                if res and res.get("type") == "PEER_LIST":
+                    with state_lock:
+                        for p in res.get("peers", []):
+                            if p != SELF_ID:  # Don't add self
+                                peer_list.add(p)
+                    log_peer(f"[PEER LIST RECEIVED] From {seed_ip}:{seed_port}: {res.get('peers')}")
+                s.close()
+                break
+            except Exception as e:
+                retries -= 1
+                if retries == 0:
+                    log_peer(f"[WARNING] Could not fetch peer list from seed {seed_ip}:{seed_port}")
+                else:
+                    time.sleep(0.5)
+
+def build_topology():
+    """
+    Implements Barabasi-Albert preferential attachment for a power-law degree distribution.
+    Peers query available nodes for their current degree, and randomly select neighbors 
+    weighted by those degrees.
+    """
+    with state_lock:
+        available = list(peer_list - {SELF_ID} - neighbors)
+    
+    if not available:
+        log_peer("[TOPOLOGY] No other peers available yet")
+        return
+
+    num_to_connect = max(1, min(3, len(available) // 2 + 1))
+    
+    # 1. Query the degrees of all available peers
+    peer_degrees = {}
+    for peer in available:
+        ip, port_str = peer.split(":")
+        try:
+            s = socket.socket()
+            s.settimeout(2)
+            s.connect((ip, int(port_str)))
+            send_json(s, {"type": "GET_DEGREE"})
+            res = recv_json(s)
+            if res and res.get("type") == "DEGREE_REPLY":
+                peer_degrees[peer] = res.get("degree", 0)
+            s.close()
+        except:
+            peer_degrees[peer] = 0 # Default to 0 if we can't reach them
+
+    # 2. Calculate probabilities (Preferential Attachment)
+    # Give a base weight of 1 so new nodes (degree 0) still have a chance to be picked
+    weights = [peer_degrees[peer] + 1 for peer in available]
+    
+    # 3. Select neighbors using the calculated weights
+    selected = []
+    available_copy = available.copy()
+    weights_copy = weights.copy()
+    
+    for _ in range(min(num_to_connect, len(available_copy))):
+        if not available_copy: break
+        # random.choices picks an element based on the provided weights
+        chosen = random.choices(available_copy, weights=weights_copy, k=1)[0]
+        selected.append(chosen)
+        
+        # Remove chosen so we don't connect to the same node twice
+        idx = available_copy.index(chosen)
+        available_copy.pop(idx)
+        weights_copy.pop(idx)
+
+    # 4. Connect to the selected peers bidirectionally
+    for peer in selected:
+        ip, port_str = peer.split(":")
+        retries = 2
+        while retries > 0:
+            try:
+                s = socket.socket()
+                s.settimeout(3)
+                s.connect((ip, int(port_str)))
+                send_json(s, {"type": "CONNECT_REQ", "peer": SELF_ID})
+                s.close()
+                
+                with state_lock:
+                    neighbors.add(peer)
+                    last_seen[peer] = time.time()
+                log_peer(f"[TOPOLOGY] Connected to {peer} (Degree was {peer_degrees[peer]})")
+                break
+            except Exception as e:
+                retries -= 1
+                if retries == 0:
+                    log_peer(f"[TOPOLOGY] Failed to connect to {peer}")
+                else:
+                    time.sleep(0.5)
+    
+    with state_lock:
+        log_peer(f"[TOPOLOGY] Neighbors established: {neighbors}")
+
+def handle_peer_client(conn, addr):
+    try:
+        data = recv_json(conn)
+        if not data: 
+            conn.close()
+            return
+
+        msg_type = data.get("type")
+
+        if msg_type == "CONNECT_REQ":
+            # Bidirectional connection established
+            sender = data.get("peer")
+            if sender and sender != SELF_ID:
+                with state_lock:
+                    neighbors.add(sender)
+                    last_seen[sender] = time.time()
+                log_peer(f"[NETWORK] Bidirectional link established with {sender}")
+
+        elif msg_type == "GOSSIP":
+            msg_str = data.get("message")
+            sender = data.get("sender")
+            
+            if not msg_str:
+                conn.close()
+                return
+
+            msg_hash = hash_message(msg_str)
+            sender_addr = sender if sender else (f"{addr[0]}:{addr[1]}" if addr else None)
+
+            with state_lock:
+                is_new = msg_hash not in message_list
+                if is_new:
+                    message_list.add(msg_hash)
+
+            if is_new:
+                # Log only FIRST-TIME gossip as required
+                # Extract timestamp from message for logging
+                try:
+                    parts = msg_str.split(":")
+                    timestamp = parts[0] if len(parts) > 0 else "unknown"
+                    log_peer(f"[GOSSIP RECEIVED] {msg_str} | From: {sender_addr} | Time: {timestamp}")
+                except:
+                    log_peer(f"[GOSSIP RECEIVED] {msg_str} | From: {sender_addr}")
+                
+                # Forward to all neighbors EXCEPT sender
+                with state_lock:
+                    targets = list(neighbors - {sender_addr} if sender_addr else neighbors)
+                
+                for target in targets:
+                    ip, port = target.split(":")
+                    retries = 2
+                    while retries > 0:
+                        try:
+                            s = socket.socket()
+                            s.settimeout(3)
+                            s.connect((ip, int(port)))
+                            send_json(s, {"type": "GOSSIP", "message": msg_str, "sender": SELF_ID})
+                            s.close()
+                            break
+                        except:
+                            retries -= 1
+                            if retries == 0:
+                                pass  # Connection failed, might trigger suspicion later
+
+        elif msg_type == "GET_DEGREE":
+            # Respond to degree queries for power-law topology construction
+            with state_lock:
+                degree = len(neighbors)
+            send_json(conn, {"type": "DEGREE_REPLY", "degree": degree})
+            conn.close()
+            return
+
+        elif msg_type == "SUSPECT_DEAD":
+            # Peer-Level Consensus logic
+            suspect = data.get("suspect")
+            reporter = data.get("reporter")
+            
+            if not suspect or not reporter:
+                conn.close()
+                return
+            
+            log_peer(f"[PEER CONSENSUS] Received suspicion from {reporter} that {suspect} is dead")
+            
+            with state_lock:
+                if suspect not in suspicion_votes:
+                    suspicion_votes[suspect] = set()
+                suspicion_votes[suspect].add(reporter)
+                
+                # If we also think it's dead (or haven't seen it), we add our vote
+                if suspect in neighbors:
+                    time_since_last = time.time() - last_seen.get(suspect, 0)
+                    if time_since_last > 10:
+                        suspicion_votes[suspect].add(SELF_ID)
+                        log_peer(f"[PEER CONSENSUS] Added our vote for {suspect} (last seen {time_since_last:.1f}s ago)")
+
+                # Check majority: need ⌊n/2⌋ + 1 of neighbors to agree
+                num_neighbors = len(neighbors)
+                required_votes = max(1, num_neighbors // 2 + 1) if num_neighbors > 0 else 1
+                current_votes = len(suspicion_votes[suspect])
+                
+                log_peer(f"[PEER CONSENSUS] {suspect}: {current_votes}/{required_votes} votes from {num_neighbors} neighbors")
+
+                # Consensus reached! Report to seeds.
+                if current_votes >= required_votes:
+                    log_peer(f"[PEER CONSENSUS] {suspect} confirmed dead by majority vote ({current_votes}/{num_neighbors} neighbors)")
+                    timestamp = int(time.time())
+                    target_ip, target_port = suspect.split(":")
+                    log_peer(f"[DEAD NODE REPORT] Dead Node:{target_ip}:{target_port}:{timestamp}:{HOST}")
+                    
+                    # Remove from our neighbor list
+                    if suspect in neighbors:
+                        neighbors.remove(suspect)
+                    if suspect in last_seen:
+                        del last_seen[suspect]
+                    if suspect in suspicion_votes:
+                        del suspicion_votes[suspect]
+                    
+                    # Report to seeds
+                    report_dead_node_to_seeds(suspect)
+
+    except Exception as e:
+        pass
+    finally:
+        conn.close()
+
+def report_dead_node_to_seeds(dead_peer):
+    """
+    Report dead node to all seeds in the exact format required:
+    Dead Node:<DeadNode.IP>:<DeadNode.Port>:<self.timestamp>:<self.IP>
+    """
+    dead_ip, dead_port = dead_peer.split(":")
+    timestamp = int(time.time())
+    report_str = f"Dead Node:{dead_ip}:{dead_port}:{timestamp}:{HOST}"
+    
+    seeds = load_seeds()
+    for seed_ip, seed_port in seeds:
+        retries = 2
+        while retries > 0:
+            try:
+                s = socket.socket()
+                s.settimeout(3)
+                s.connect((seed_ip, seed_port))
+                s.sendall(report_str.encode('utf-8'))
+                s.close()
+                break
+            except:
+                retries -= 1
+                if retries == 0:
+                    pass  # Seed might be down, continue to next
+
+def peer_server_thread():
+    server = socket.socket()
+    server.bind((HOST, PORT))
+    server.listen()
+    log_peer(f"[PEER STARTED] Listening on {HOST}:{PORT}")
+    while True:
+        try:
+            conn, addr = server.accept()
+            threading.Thread(target=handle_peer_client, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            log_peer(f"[ERROR] Error accepting connection: {e}")
+
+def gossip_generator():
+    time.sleep(5) # Wait for topology to settle
+    for msg_num in range(10):  # Generate 10 messages (0-9)
+        timestamp = int(time.time())
+        # Format: <timestamp>:<self.IP>:<self.Msg#> (3 fields separated by colons)
+        # Using SELF_ID which is "IP:PORT" as the identifier
+        msg_str = f"{timestamp}:{SELF_ID}:{msg_num}"
+        msg_hash = hash_message(msg_str)
+        
+        with state_lock:
+            message_list.add(msg_hash)
+            targets = list(neighbors)
+
+        log_peer(f"[GOSSIP GENERATED] {msg_str}")
+        
+        for target in targets:
+            ip, port = target.split(":")
+            retries = 2
+            while retries > 0:
+                try:
+                    s = socket.socket()
+                    s.settimeout(3)
+                    s.connect((ip, int(port)))
+                    send_json(s, {"type": "GOSSIP", "message": msg_str, "sender": SELF_ID})
+                    s.close()
+                    break
+                except:
+                    retries -= 1
+                    if retries == 0:
+                        pass  # Connection failed, might trigger suspicion later
+        time.sleep(5)
+
+def liveness_monitor():
+    """
+    Periodically checks if neighbors are alive using socket connection attempts.
+    If a connection fails, initiates local suspicion phase.
+    
+    Note: The assignment says "system-level ping", but ICMP pings do not check ports.
+    If you test this on 127.0.0.1, an ICMP ping will always return true even if the node is dead.
+    This script uses a socket connection attempt to verify the specific port is alive.
+    """
+    while True:
+        time.sleep(5)
+        with state_lock:
+            current_neighbors = list(neighbors)
+            
+        for peer in current_neighbors:
+            ip, port = peer.split(":")
+            is_alive = False
+            try:
+                # System ping check substitute for specific port
+                # This verifies the peer service is actually running on the port
+                s = socket.socket()
+                s.settimeout(2)
                 s.connect((ip, int(port)))
                 s.close()
+                is_alive = True
+                with state_lock:
+                    last_seen[peer] = time.time()
             except:
-                print(f"[PING FAILED] Suspecting {neighbor}")
-                initiate_suspicion(neighbor)
+                is_alive = False
 
-def initiate_suspicion(target):
-    """
-    Starts peer-level consensus for suspected node.
-    Sends SUSPECT_REQUEST to other neighbors.
-    """
-    with lock:
-        if target in suspicions:
-            return  # Already under suspicion
+            if not is_alive:
+                with state_lock:
+                    time_since_last = time.time() - last_seen.get(peer, 0)
+                
+                # Local suspicion phase trigger
+                if time_since_last > 10: 
+                    log_peer(f"[PING FAILED] Neighbor {peer} is not responding to system-level ping")
+                    log_peer(f"[LOCAL SUSPICION] {peer} missed pings. Initiating peer consensus.")
+                    
+                    with state_lock:
+                        if peer not in suspicion_votes:
+                            suspicion_votes[peer] = set()
+                        suspicion_votes[peer].add(SELF_ID)
+                        other_neighbors = list(neighbors - {peer})
+                        
+                    for neighbor in other_neighbors:
+                        n_ip, n_port = neighbor.split(":")
+                        retries = 2
+                        while retries > 0:
+                            try:
+                                s = socket.socket()
+                                s.settimeout(3)
+                                s.connect((n_ip, int(n_port)))
+                                send_json(s, {"type": "SUSPECT_DEAD", "suspect": peer, "reporter": SELF_ID})
+                                s.close()
+                                break
+                            except:
+                                retries -= 1
+                                if retries == 0:
+                                    pass  # Neighbor might be down too
 
-        suspicions[target] = {
-            "votes": set(),
-            "start_time": time.time()
-        }
-
-    for peer in neighbors:
-        if peer == target:
-            continue
-        send_suspect_request(peer, target)
-
-def send_suspect_request(peer, target):
-    """
-    Ask another peer if it can reach target.
-    """
-    ip, port = peer.split(":")
-    try:
-        s = socket.socket()
-        s.settimeout(3)
-
-        s.connect((ip, int(port)))
-        send_json(s, {
-            "type": "SUSPECT_REQUEST",
-            "target": target,
-            "requester": f"{HOST}:{PORT}"
-        })
-        s.close()
-    except:
-        pass
-
-def check_node_alive(node):
-    """
-    Attempt direct ping.
-    Returns True if reachable, False otherwise.
-    """
-    ip, port = node.split(":")
-    try:
-        s = socket.socket()
-        s.settimeout(3)
-
-        s.settimeout(PING_TIMEOUT)
-        s.connect((ip, int(port)))
-        s.close()
-        return True
-    except:
-        return False
-    
-
-def suspicion_cleanup():
-    while True:
-        time.sleep(2)
-        now = time.time()
-
-        with lock:
-            to_remove = []
-            for target, data in suspicions.items():
-                if now - data["start_time"] > SUSPICION_TIMEOUT:
-                    print(f"[SUSPICION CLEARED] {target}")
-                    to_remove.append(target)
-
-            for t in to_remove:
-                del suspicions[t]
-
-# MAIN EXECUTION FLOW:
 if __name__ == "__main__":
-    # 1. Tell seeds we exist
-    register()
-    time.sleep(2) # Wait for seeds to finish voting
-    # 2. Get the list of other active peers
-    peers = fetch_peers()
-    # 3. Save them as neighbors
-    neighbors.update(peers)
-
-    # 4. Start a thread to send messages every few seconds
-    threading.Thread(target=gossip_sender).start()
-
-    # 5. Start a thread to ping neighbors and check for failures
-    threading.Thread(target=ping_neighbors).start()
-
-    threading.Thread(target=suspicion_cleanup).start()
-
-    # Start the server to receive messages from others
-    start_server()
+    try:
+        # Initialize log file - all nodes write to the same file
+        log_filename = "outputfile.txt"
+        log_file = open(log_filename, "a")
+        log_peer(f"[PEER STARTED] {HOST}:{PORT}")
+        
+        threading.Thread(target=peer_server_thread, daemon=True).start()
+        
+        register_and_get_peers()
+        build_topology()
+        
+        threading.Thread(target=gossip_generator, daemon=True).start()
+        threading.Thread(target=liveness_monitor, daemon=True).start()
+        
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            log_peer("[SHUTDOWN] Peer shutting down")
+    except Exception as e:
+        log_peer(f"[ERROR] Fatal error: {e}")
+        if log_file:
+            log_file.close()
+        sys.exit(1)
+    finally:
+        if log_file:
+            log_file.close()
